@@ -349,8 +349,8 @@ class MemoryStore:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
-        file) and, unless *skip_drift*, on external drift (flushing would discard
-        un-roundtrippable content). Drift check and parse use the SAME raw snapshot —
+        file) and, unless *skip_drift*, refuses a write that adds or rewrites text while an
+        entry is over the whole-file limit (it may hold free text a flush would discard). Drift check and parse use the SAME raw snapshot —
         a failed second read used to count as "no drift". The closure may return a
         third value, a dict merged into the success payload (``_error``'s ``**extra``
         convention) — e.g. the full text a replace overwrote (#117952). ANY dict the closure
@@ -361,19 +361,27 @@ class MemoryStore:
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
                 return _read_failed_error(path)
-            bak = None if skip_drift else self._detect_external_drift(target, raw)
-            self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
-            if bak:
-                return _drift_error(path, bak)
+            oversized = not skip_drift and self._has_oversized_entry(target, raw)
+            before = list(dict.fromkeys(self._parse_entries(raw)))
+            self._set_entries(target, before)
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 return result
+            extra_fields = dict(result[2]) if len(result) > 2 else {}
+            # An oversized entry is either free text appended without a delimiter or an entry written before the limit was lowered. Pruning is the way
+            # back under a lowered limit, so a write that only deletes entries proceeds; one that
+            # drops an oversized entry keeps the snapshot first, as it may hold appended text.
+            if oversized:
+                if not set(result[0]) <= set(before):
+                    return _drift_error(path, self._drift_backup(target, raw))
+                limit = self._char_limit(target)
+                if any(len(e) > limit for e in before if e not in result[0]):
+                    extra_fields["drift_backup"] = self._drift_backup(target, raw)
             self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
             self._write_file(path, result[0])
-            extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
 
     def add(self, target: str, content: str) -> dict[str, Any]:
@@ -694,15 +702,17 @@ class MemoryStore:
         except OSError as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
-    def _detect_external_drift(self, target: str, raw: str) -> Optional[str]:
-        """``.bak.<ts>`` snapshot path if *raw* shows external drift, else None. The one
-        signal is an entry over the whole-file limit: no tool-written entry can be, so it is
-        free-form text appended without delimiters, and replacing that "entry" would discard
-        it. Layout differences (blank lines around ``§``, empty entries, padding) are NOT
-        drift: parsing only strips whitespace, so the flush loses nothing but whitespace, and
-        refusing there blocked every replace/remove on a hand-formatted file for good (#107270)."""
-        if max(map(len, self._parse_entries(raw)), default=0) <= self._char_limit(target):
-            return None
+    def _has_oversized_entry(self, target: str, raw: str) -> bool:
+        """True when one entry in *raw* is longer than the whole-file limit. A tool write
+        never produces one, so it is free-form text appended without delimiters, or an entry
+        written before the limit was lowered. Layout differences (blank lines around ``§``,
+        empty entries, padding) are NOT drift: parsing only strips whitespace, so the flush
+        loses nothing but whitespace, and refusing there blocked every replace/remove on a
+        hand-formatted file for good (#107270)."""
+        return max(map(len, self._parse_entries(raw)), default=0) > self._char_limit(target)
+
+    def _drift_backup(self, target: str, raw: str) -> str:
+        """``.bak.<ts>`` snapshot of *raw* before a drift refusal."""
         path = self._path_for(target)
         bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
         try:
