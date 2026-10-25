@@ -686,13 +686,20 @@ class TestExternalDriftGuard:
         """An entry written under a larger limit is no external drift: pruning stays the way back
         under a lowered limit."""
         roomy = MemoryStore(memory_char_limit=2200, user_char_limit=1375)
-        background = "Background:" + " firmware and vision pipelines;" * 16  # > the fixture's 300
-        assert roomy.add("user", background)["success"] and roomy.add("user", "Prefers metric.")["success"]
+        work, home = ("Work:" + " firmware and vision pipelines;" * 16,  # each > the fixture's 300
+                      "Home:" + " garden, workshop and bikes;" * 16)
+        for entry in (work, home, "Prefers metric.", "Uses vim."):
+            assert roomy.add("user", entry)["success"]
 
-        assert store.remove("user", "Prefers metric")["success"] is True
-        removed = store.remove("user", "Background")
-        assert removed["success"] is True and removed["removed_entry"] == background
+        pruned = json.loads(memory_tool(target="user", store=store, operations=[
+            {"action": "remove", "old_text": "Prefers metric"}, {"action": "remove", "old_text": "Uses vim"}]))
+        assert pruned["success"] is True
+        first, second = store.remove("user", "Work:"), store.remove("user", "Home:")
+        assert first["success"] and second["success"] and first["removed_entry"] == work
         assert MemoryStore._read_file(store._path_for("user")) == []
+        # Each delete of an oversized entry keeps its own snapshot, even within the same second.
+        assert first["drift_backup"] != second["drift_backup"]
+        assert work in Path(first["drift_backup"]).read_text(encoding="utf-8")
 
     def test_removing_an_entry_with_glued_free_text_keeps_a_snapshot(self, store):
         """Free text appended without a delimiter rides on the last entry; deleting that entry

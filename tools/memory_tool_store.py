@@ -3,6 +3,7 @@ Entries are joined by ``ENTRY_DELIMITER``; budgets are in chars (model-independe
 Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) stays
 in ``tools.memory_tool`` and is read lazily."""
 
+import itertools
 import logging
 import os
 import re
@@ -34,6 +35,7 @@ def _scan_memory_content(content: str) -> Optional[str]:
 # Why the last refusal/failure in this context happened, for the shared metric only (a closed name from
 # shared_metrics_contract.MEMORY_OP_FAILURE_CLASSES); never part of the result the model sees.
 FAILURE_CLASS: ContextVar[str] = ContextVar("memory_failure_class", default="other")
+_BACKUP_FAILED = " (BACKUP FAILED — file unchanged on disk)"
 
 
 def _error(message: str, failure_class: str, **extra) -> dict[str, Any]:
@@ -381,7 +383,10 @@ class MemoryStore:
                     return _drift_error(path, self._drift_backup(target, raw))
                 limit = self._char_limit(target)
                 if any(len(e) > limit for e in before if e not in result[0]):
-                    extra_fields["drift_backup"] = self._drift_backup(target, raw)
+                    bak = self._drift_backup(target, raw)
+                    if bak.endswith(_BACKUP_FAILED):  # no copy, no delete of possibly glued text
+                        return _drift_error(path, bak)
+                    extra_fields["drift_backup"] = bak
             self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
@@ -611,9 +616,10 @@ class MemoryStore:
                     f"entries into a shorter one instead of removing the last one. To delete the "
                     f"final entry deliberately, remove it alone in a one-item batch."), "would_empty")
             new_total = len(ENTRY_DELIMITER.join(working))  # budget check against the FINAL state only
-            # A one-item remove or duplicate add never grows the store, so like the legacy
-            # remove/add it is not refused for excess left by a lowered cap.
-            grows = not (len(ops) == 1 and (ops[0].get("action") == "remove" or working == entries))
+            # A remove-only batch or a lone duplicate add never grows the store, so like the
+            # legacy remove/add it is not refused for excess left by a lowered cap.
+            grows = not (all(op.get("action") == "remove" for op in ops)
+                         or (len(ops) == 1 and working == entries))
             if grows and new_total > limit:
                 if len(ops) == 1 and ops[0].get("action") == "add":  # the advertised single add
                     return self._add_overflow(target, (ops[0].get("content") or ops[0].get("new_text") or "").strip(), limit)
@@ -717,11 +723,18 @@ class MemoryStore:
         return max(map(len, self._parse_entries(raw)), default=0) > self._char_limit(target)
 
     def _drift_backup(self, target: str, raw: str) -> str:
-        """``.bak.<ts>`` snapshot of *raw* before a drift refusal."""
+        """``.bak.<ts>[.<n>]`` snapshot of *raw* before a drift refusal or a delete that drops an
+        oversized entry. Created exclusively: two snapshots in the same second never overwrite
+        each other, since a later delete's snapshot no longer holds what an earlier one removed."""
         path = self._path_for(target)
-        bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
-        try:
-            bak_path.write_text(raw, encoding="utf-8")
-        except OSError:
-            return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
-        return str(bak_path)
+        stem = path.suffix + f".bak.{int(time.time())}"
+        for n in itertools.count():
+            bak_path = path.with_suffix(stem + (f".{n}" if n else ""))
+            try:
+                with open(bak_path, "x", encoding="utf-8") as fh:
+                    fh.write(raw)
+                return str(bak_path)
+            except FileExistsError:
+                continue
+            except OSError:
+                return str(bak_path) + _BACKUP_FAILED
