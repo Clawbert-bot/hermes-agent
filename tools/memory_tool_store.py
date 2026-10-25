@@ -364,8 +364,13 @@ class MemoryStore:
             oversized = not skip_drift and self._has_oversized_entry(target, raw)
             before = list(dict.fromkeys(self._parse_entries(raw)))
             self._set_entries(target, before)
+            FAILURE_CLASS.set("other")  # read below: only this closure's refusal counts
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
+                # Over budget beside an oversized entry: that entry is the obstacle, so report
+                # the drift (with its snapshot) rather than a budget the model cannot meet.
+                if oversized and result.get("success") is False and FAILURE_CLASS.get() == "over_budget":
+                    return _drift_error(path, self._drift_backup(target, raw))
                 return result
             extra_fields = dict(result[2]) if len(result) > 2 else {}
             # An oversized entry is either free text appended without a delimiter or an entry written before the limit was lowered. Pruning is the way
