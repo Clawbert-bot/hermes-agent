@@ -682,7 +682,7 @@ class TestExternalDriftGuard:
         result = store.replace("memory", "Entry two", "Entry two replaced.")
         assert result["success"] is True
 
-    def test_entries_stay_removable_after_the_limit_is_lowered(self, store):
+    def test_entries_stay_removable_after_the_limit_is_lowered(self, store, monkeypatch):
         """An entry written under a larger limit is no external drift: pruning stays the way back
         under a lowered limit."""
         roomy = MemoryStore(memory_char_limit=2200, user_char_limit=1375)
@@ -694,6 +694,7 @@ class TestExternalDriftGuard:
         pruned = json.loads(memory_tool(target="user", store=store, operations=[
             {"action": "remove", "old_text": "Prefers metric"}, {"action": "remove", "old_text": "Uses vim"}]))
         assert pruned["success"] is True
+        monkeypatch.setattr("tools.memory_tool_store.time.time", lambda: 1_700_000_000.0)  # same second
         first, second = store.remove("user", "Work:"), store.remove("user", "Home:")
         assert first["success"] and second["success"] and first["removed_entry"] == work
         assert MemoryStore._read_file(store._path_for("user")) == []
